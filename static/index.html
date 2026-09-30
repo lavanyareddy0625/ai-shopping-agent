@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Shopping Agent</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: #1d1d1f; background: #f5f5f7; }
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+  aside { background: #fff; border-right: 1px solid #ddd; padding: 16px; overflow-y: auto; max-height: 100vh; position: sticky; top: 0; }
+  main { padding: 24px; max-width: 1000px; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  h2 { font-size: 17px; margin: 24px 0 8px; }
+  form { display: flex; gap: 8px; }
+  input { flex: 1; padding: 10px 12px; font-size: 15px; border: 1px solid #bbb; border-radius: 6px; }
+  button { padding: 10px 16px; font-size: 15px; border: 0; border-radius: 6px; background: #0b57d0; color: #fff; cursor: pointer; }
+  button:disabled { background: #999; cursor: default; }
+  .examples { margin: 8px 0 0; font-size: 13px; color: #555; }
+  .examples a { color: #0b57d0; cursor: pointer; margin-right: 10px; }
+  .history-item { padding: 8px; border-radius: 6px; cursor: pointer; font-size: 14px; border-bottom: 1px solid #eee; }
+  .history-item:hover { background: #f0f4ff; }
+  .history-item small { color: #777; display: block; }
+  .status-error { color: #b3261e; } .status-running { color: #9a6700; } .status-done { color: #1e7d32; }
+  #steps { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; font-size: 13px; font-family: ui-monospace, monospace; max-height: 320px; overflow-y: auto; }
+  #steps:empty { display: none; }
+  .step { padding: 4px 0; border-bottom: 1px dashed #eee; white-space: pre-wrap; word-break: break-word; }
+  .step b { color: #0b57d0; }
+  .step details summary { cursor: pointer; color: #555; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 4px; font-size: 16px; }
+  .price { font-size: 18px; font-weight: 600; color: #1e7d32; }
+  .card ul { margin: 6px 0; padding-left: 20px; }
+  .card a { color: #0b57d0; word-break: break-all; font-size: 13px; }
+  .req { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f0f0f0; }
+  .error { color: #b3261e; background: #fdecea; padding: 10px; border-radius: 6px; }
+  .muted { color: #777; font-size: 13px; }
+  @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } aside { position: static; max-height: 240px; } }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h2 style="margin-top:0">Search history</h2>
+    <div id="history" class="muted">Loading…</div>
+  </aside>
+  <main>
+    <h1>🛒 AI Shopping Agent</h1>
+    <form id="form">
+      <input id="query" placeholder='e.g. find the best laptop for AI development under 70,000' autocomplete="off" required>
+      <button id="go">Search</button>
+    </form>
+    <div class="examples">Try:
+      <a>best laptop for AI development under 70,000</a>
+      <a>noise cancelling headphones under 15000 rupees</a>
+      <a>best phone for photography under $500</a>
+    </div>
+
+    <h2 id="steps-title" hidden>Agent steps</h2>
+    <div id="steps"></div>
+    <div id="output"></div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const money = (p, cur) => p == null ? "Price n/a" : `${cur === "USD" ? "$" : cur && cur !== "INR" ? cur + " " : "₹"}${Number(p).toLocaleString("en-IN")}`;
+
+document.querySelectorAll(".examples a").forEach((a) => a.onclick = () => { $("query").value = a.textContent; });
+
+function describeCall(ev) {
+  const a = ev.args || {};
+  if (ev.name === "web_search") return `🔎 web_search("${a.query}")`;
+  if (ev.name === "extract_product") return `📄 extract_product(${a.url})`;
+  if (ev.name === "compare_products") return `⚖️ compare_products(${(a.products || []).length} candidates, budget=${a.budget ?? "none"})`;
+  if (ev.name === "parse_requirements") return `🧠 parse_requirements`;
+  if (ev.name === "submit_recommendations") return `✅ submit_recommendations`;
+  return ev.name;
+}
+
+function describeResult(ev) {
+  const r = ev.result || {};
+  if (r.error) return `⚠️ ${r.error}`;
+  if (ev.name === "web_search") return `${(r.results || []).length} results`;
+  if (ev.name === "extract_product") return `${r.name || "page"} ${r.price != null ? "· " + money(r.price, r.currency) : ""} · ${(r.specs || []).length} spec lines`;
+  if (ev.name === "compare_products") return `ranked ${(r.ranked || []).length}, excluded ${(r.over_budget_excluded || []).length} over budget`;
+  return "ok";
+}
+
+function addStep(ev) {
+  const div = document.createElement("div");
+  div.className = "step";
+  if (ev.type === "meta") div.innerHTML = `<span class="muted">LLM: ${esc(ev.provider)} / ${esc(ev.model)}</span>`;
+  else if (ev.type === "thought") div.textContent = `💭 ${ev.text}`;
+  else if (ev.type === "model_switch") div.innerHTML = `<span class="muted">🔁 ${esc(ev.from)}: ${esc(ev.reason)} — switching to ${esc(ev.to)}</span>`;
+  else if (ev.type === "waiting") div.innerHTML = `<span class="muted">⏳ ${esc(ev.reason)} — waiting ${ev.seconds}s, then continuing…</span>`;
+  else if (ev.type === "tool_call") div.innerHTML = `<b>→ ${esc(describeCall(ev))}</b>`;
+  else if (ev.type === "tool_result")
+    div.innerHTML = `<details><summary>← ${esc(ev.name)}: ${esc(describeResult(ev))}</summary>${esc(JSON.stringify(ev.result, null, 2))}</details>`;
+  else return;
+  $("steps").appendChild(div);
+  $("steps").scrollTop = $("steps").scrollHeight;
+}
+
+function renderRequirements(req) {
+  if (!req) return "";
+  const list = (xs) => (xs || []).map(esc).join(", ") || "—";
+  return `<h2>Understood requirements</h2><div class="req">
+    <b>${esc(req.product_type)}</b> for <i>${esc(req.use_case)}</i>
+    ${req.budget_max ? ` · budget ≤ ${money(req.budget_max, req.currency)}` : ""}<br>
+    Must have: ${list(req.must_have)}<br>Nice to have: ${list(req.nice_to_have)}</div>`;
+}
+
+function renderResults({ requirements, summary, recommendations, comparison }) {
+  let html = renderRequirements(requirements);
+  html += `<h2>Recommendations</h2>`;
+  if (summary) html += `<p>${esc(summary)}</p>`;
+  (recommendations || []).forEach((r, i) => {
+    html += `<div class="card">
+      <h3>#${i + 1} ${esc(r.name)}</h3>
+      <div class="price">${money(r.price, r.currency)}</div>
+      <ul>${(r.key_details || []).map((d) => `<li>${esc(d)}</li>`).join("")}</ul>
+      <div><b>Why:</b> ${esc(r.reason)}</div>
+      <a href="${esc(r.source_url)}" target="_blank" rel="noopener">${esc(r.source_url)}</a>
+    </div>`;
+  });
+  if (comparison && (comparison.ranked || []).length) {
+    html += `<h2>Comparison table</h2><table><tr><th>#</th><th>Product</th><th>Price</th><th>Fit</th><th>Score</th><th>Parsed specs</th></tr>`;
+    comparison.ranked.forEach((p) => {
+      const specs = Object.entries(p.parsed_specs || {}).map(([k, v]) => `${k}: ${v}`).join(", ");
+      html += `<tr><td>${p.rank}</td><td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.name)}</a>${p.notes?.length ? `<br><small>${esc(p.notes.join(", "))}</small>` : ""}</td>
+        <td>${money(p.price, p.currency)}</td><td>${p.fit_score}</td><td>${p.score}</td><td>${esc(specs)}</td></tr>`;
+    });
+    html += `</table><p class="muted">${esc(comparison.method)}</p>`;
+    if ((comparison.over_budget_excluded || []).length)
+      html += `<p class="muted">Excluded (over budget): ${comparison.over_budget_excluded.map((p) => `${esc(p.name)} (${money(p.price)})`).join("; ")}</p>`;
+  }
+  html += `<p class="muted">Prices are taken from public web pages at search time and may have changed.</p>`;
+  $("output").innerHTML = html;
+}
+
+async function loadHistory() {
+  const items = await (await fetch("/api/history")).json();
+  $("history").innerHTML = items.length ? items.map((s) => `
+    <div class="history-item" data-id="${s.id}">${esc(s.query)}
+      <small><span class="status-${s.status}">${s.status}</span> · ${s.n_results} results · ${new Date(s.created_at).toLocaleString()}</small>
+    </div>`).join("") : `<span class="muted">No searches yet.</span>`;
+  document.querySelectorAll(".history-item").forEach((el) => el.onclick = () => showSearch(el.dataset.id));
+}
+
+async function showSearch(id) {
+  const s = await (await fetch(`/api/history/${id}`)).json();
+  $("query").value = s.query;
+  $("steps").innerHTML = "";
+  $("steps-title").hidden = false;
+  s.steps.forEach(addStep);
+  if (s.status === "error") $("output").innerHTML = `<div class="error">${esc(s.error)}</div>`;
+  else renderResults(s);
+}
+
+$("form").onsubmit = async (e) => {
+  e.preventDefault();
+  const query = $("query").value.trim();
+  if (!query) return;
+  $("go").disabled = true; $("go").textContent = "Working…";
+  $("steps").innerHTML = ""; $("steps-title").hidden = false;
+  $("output").innerHTML = `<p class="muted">The agent is researching — this usually takes 20–90 seconds.</p>`;
+  let requirements = null;
+  try {
+    const resp = await fetch("/api/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        addStep(ev);
+        if (ev.type === "start") loadHistory();
+        if (ev.type === "requirements") { requirements = ev.requirements; $("output").innerHTML = renderRequirements(requirements) + `<p class="muted">Searching and comparing…</p>`; }
+        if (ev.type === "final") renderResults({ requirements, ...ev.result, comparison: ev.comparison });
+        if (ev.type === "error") $("output").innerHTML = `<div class="error">${esc(ev.message)}</div>`;
+      }
+    }
+  } catch (err) {
+    $("output").innerHTML = `<div class="error">${esc(err.message)}</div>`;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "Search";
+    loadHistory();
+  }
+};
+
+loadHistory();
+</script>
+</body>
+</html>

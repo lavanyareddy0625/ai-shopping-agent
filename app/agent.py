@@ -1,0 +1,318 @@
+"""The shopping agent: an LLM tool-calling loop over search / extract / compare tools.
+
+`run_agent` is a generator that yields progress events, so the API can stream
+each step to the browser and store it in the database as it happens.
+"""
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from typing import Any, Iterator, Optional
+
+import openai
+
+from . import tools
+from .llm import get_client
+
+MAX_ROUNDS = 12
+MAX_TOOL_CHARS = 3500  # keep tool output small: free-tier LLMs have tight token limits
+MAX_RATE_LIMIT_WAITS = 8
+
+SYSTEM_PROMPT = """You are ShopAgent, an autonomous shopping research assistant. Today is {today}.
+
+Follow this workflow. LLM calls are rate-limited, so put independent tool calls in the SAME
+response (they run in parallel) and aim to finish in 4 responses:
+1. In ONE response: call parse_requirements (product type, budget, currency, use case, must-have
+   specs, search queries) AND web_search for 2-3 queries. Infer sensible specs for the use case
+   (e.g. AI/ML development laptop -> NVIDIA RTX GPU with more VRAM, 16GB+ RAM, 512GB+ SSD).
+   Include the year, "price" and the country/currency in queries (a budget like "70,000" with no
+   currency means Indian Rupees).
+2. In ONE response: call extract_product on the 3-5 most promising URLs (retailer product pages
+   or recent "best X under Y" listing pages). If a page is blocked, rely on its search snippet.
+   Only search again if the results so far are clearly insufficient.
+3. compare_products - build 4-8 concrete candidates (specific model name, price, key specs,
+   source url) and give each a fit_score 0-10 for how well it meets the requirements.
+4. submit_recommendations - submit the top 3 (max 5) from the comparison ranking.
+
+Rules:
+- Only use facts found in tool results. Never invent prices, specs or URLs; every source_url must
+  be a URL that appeared in a tool result.
+- Respect the budget. Mention that prices are approximate as of the source and can change.
+- Be efficient: finish within about 8 tool rounds.
+"""
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "parse_requirements",
+            "description": "Record the structured interpretation of the user's shopping request.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_type": {"type": "string"},
+                    "budget_max": {"type": "number", "description": "Maximum price, numeric. Omit if none."},
+                    "currency": {"type": "string", "description": "ISO code, e.g. INR, USD"},
+                    "use_case": {"type": "string"},
+                    "must_have": {"type": "array", "items": {"type": "string"}},
+                    "nice_to_have": {"type": "array", "items": {"type": "string"}},
+                    "search_queries": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["product_type", "use_case", "search_queries"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the public web. Returns titles, URLs and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "1-10, default 8"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_product",
+            "description": "Fetch a web page and extract product name, price, rating, spec lines and price mentions.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_products",
+            "description": "Deduplicate, filter by budget and rank candidate products by fit, price and specs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "products": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "price": {"type": "number"},
+                                "currency": {"type": "string"},
+                                "url": {"type": "string"},
+                                "specs": {
+                                    "type": "object",
+                                    "description": "e.g. {cpu, gpu, ram, storage, display}",
+                                    "additionalProperties": {"type": "string"},
+                                },
+                                "fit_score": {"type": "number", "description": "0-10 fit to requirements"},
+                            },
+                            "required": ["name", "url", "fit_score"],
+                        },
+                    },
+                    "budget": {"type": "number"},
+                    "priorities": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["products"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_recommendations",
+            "description": "Submit the final ranked recommendations to the user. Ends the task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "2-4 sentence overview and buying advice"},
+                    "recommendations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "price": {"type": "number"},
+                                "currency": {"type": "string"},
+                                "key_details": {"type": "array", "items": {"type": "string"}},
+                                "reason": {"type": "string"},
+                                "source_url": {"type": "string"},
+                            },
+                            "required": ["name", "key_details", "reason", "source_url"],
+                        },
+                    },
+                },
+                "required": ["summary", "recommendations"],
+            },
+        },
+    },
+]
+
+
+def _parse_requirements(**kwargs: Any) -> dict:
+    return {"ok": True, "requirements": kwargs}
+
+
+def _submit_recommendations(**kwargs: Any) -> dict:
+    return {"ok": True}
+
+
+TOOL_FUNCS = {
+    "parse_requirements": _parse_requirements,
+    "web_search": tools.web_search,
+    "extract_product": tools.extract_product,
+    "compare_products": tools.compare_products,
+    "submit_recommendations": _submit_recommendations,
+}
+
+
+def _call_tool(name: str, args: dict) -> dict:
+    func = TOOL_FUNCS.get(name)
+    if not func:
+        return {"error": f"Unknown tool {name}"}
+    try:
+        return func(**args)
+    except TypeError as e:
+        return {"error": f"Bad arguments for {name}: {e}"}
+    except Exception as e:
+        return {"error": f"{name} failed: {type(e).__name__}: {e}"}
+
+
+def _truncate(result: dict) -> str:
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    return text if len(text) <= MAX_TOOL_CHARS else text[:MAX_TOOL_CHARS] + '..."(truncated)"'
+
+
+def _retry_delay(err: Exception) -> float:
+    """Seconds to wait after a rate-limit error ("retry in 51.2s" / retryDelay '51s')."""
+    m = re.search(r"retry in ([\d.]+)s|retryDelay'?\"?:\s*'?\"?(\d+)", str(err), re.I)
+    delay = float(m.group(1) or m.group(2)) if m else 20.0
+    return min(delay + 1, 70.0)
+
+
+def _is_daily_quota(err: Exception) -> bool:
+    text = str(err)
+    return "PerDay" in text or "per day" in text.lower()
+
+
+def _completion(client, models: list[str], messages: list, tool_choice: Any = "auto"):
+    """Call the LLM (a generator: yields progress events, returns the response).
+
+    `models` is the fallback list; models[0] is used. Per-minute rate limits are
+    waited out; a model whose daily quota is used up (or that has been retired)
+    is dropped and the next one takes over. Malformed tool calls are retried.
+    """
+    bad_request_retries = 0
+    waits = 0
+    while True:
+        model = models[0]
+        try:
+            return client.chat.completions.create(
+                model=model, messages=messages, tools=TOOL_SCHEMAS,
+                tool_choice=tool_choice, temperature=0.2,
+            )
+        except (openai.RateLimitError, openai.NotFoundError, openai.InternalServerError) as e:
+            if not isinstance(e, openai.RateLimitError) or _is_daily_quota(e):
+                if len(models) == 1:
+                    raise RuntimeError(
+                        f"No model left to try (last: {model}): free-tier quotas used up or servers busy. "
+                        f"Try again later or add a key for the other provider. Details: {e}"
+                    )
+                models.pop(0)
+                why = {openai.RateLimitError: "daily quota used up", openai.NotFoundError: "model unavailable",
+                       }.get(type(e), "model overloaded")
+                yield {"type": "model_switch", "from": model, "to": models[0], "reason": why}
+                continue
+            waits += 1
+            if waits > MAX_RATE_LIMIT_WAITS:
+                raise RuntimeError("LLM still rate-limited after several waits; try again in a few minutes.")
+            delay = _retry_delay(e)
+            yield {"type": "waiting", "seconds": round(delay), "reason": "LLM free-tier rate limit"}
+            time.sleep(delay)
+        except openai.BadRequestError as e:
+            if "tool" in str(e).lower() and bad_request_retries < 2:
+                bad_request_retries += 1
+                continue
+            raise
+
+
+def _assistant_message(msg) -> dict:
+    # model_dump keeps provider extras (e.g. Gemini thought signatures on tool calls).
+    dumped = msg.model_dump(exclude_none=True)
+    out = {"role": "assistant", "content": dumped.get("content") or ""}
+    if dumped.get("tool_calls"):
+        out["tool_calls"] = dumped["tool_calls"]
+    return out
+
+
+def run_agent(query: str, client=None, model: Optional[str] = None) -> Iterator[dict]:
+    """Run the agent; yields events: meta, thought, tool_call, tool_result, final, ..."""
+    provider = "custom"
+    if client is None:
+        client, models, provider = get_client()
+    else:
+        models = [model]
+    yield {"type": "meta", "provider": provider, "model": models[0]}
+
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(today=date.today().isoformat())},
+        {"role": "user", "content": query},
+    ]
+    comparison: Optional[dict] = None
+    pool = ThreadPoolExecutor(max_workers=6)
+
+    try:
+        for round_no in range(MAX_ROUNDS + 1):
+            forced = round_no == MAX_ROUNDS
+            tool_choice = {"type": "function", "function": {"name": "submit_recommendations"}} if forced else "auto"
+            if forced:
+                messages.append({"role": "user", "content": "Tool budget exhausted. Submit your recommendations now."})
+
+            msg = (yield from _completion(client, models, messages, tool_choice)).choices[0].message
+            if msg.content and msg.content.strip():
+                yield {"type": "thought", "text": msg.content.strip()}
+
+            if not msg.tool_calls:
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append({"role": "user", "content": "Continue the workflow using the tools; finish by calling submit_recommendations."})
+                continue
+
+            messages.append(_assistant_message(msg))
+
+            calls = []
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append((tc, tc.function.name, args))
+                yield {"type": "tool_call", "name": tc.function.name, "args": args}
+
+            # Independent tool calls (e.g. several searches or page fetches) run in parallel.
+            results = list(pool.map(lambda c: _call_tool(c[1], c[2]), calls))
+
+            final = None
+            for (tc, name, args), result in zip(calls, results):
+                yield {"type": "tool_result", "name": name, "result": result}
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _truncate(result)})
+                if name == "parse_requirements":
+                    yield {"type": "requirements", "requirements": args}
+                elif name == "compare_products" and "ranked" in result:
+                    comparison = result
+                elif name == "submit_recommendations":
+                    final = args
+
+            if final is not None:
+                yield {"type": "final", "result": final, "comparison": comparison}
+                return
+
+        raise RuntimeError("Agent did not produce recommendations")
+    finally:
+        pool.shutdown(wait=False)
