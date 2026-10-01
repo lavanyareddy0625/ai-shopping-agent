@@ -68,7 +68,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const money = (p, cur) => p == null ? "Price n/a" : `${cur === "USD" ? "$" : cur && cur !== "INR" ? cur + " " : "₹"}${Number(p).toLocaleString("en-IN")}`;
+const money = (p, cur) => p == null ? "Price n/a" : `${cur === "USD" ? "$" : cur === "INR" ? "₹" : cur ? cur + " " : ""}${Number(p).toLocaleString("en-IN")}`;
 
 document.querySelectorAll(".examples a").forEach((a) => a.onclick = () => { $("query").value = a.textContent; });
 

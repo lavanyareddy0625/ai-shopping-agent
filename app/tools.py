@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlparse
 from typing import Any, Iterator, Optional
 
 import httpx
@@ -31,6 +32,21 @@ SPEC_KEYWORDS = (
     "storage", "ssd", "display", "screen", "resolution", "refresh", "battery",
     "weight", "operating system", "cores", "camera", "warranty",
 )
+
+_TLD_CURRENCY = {"in": "INR", "uk": "GBP", "de": "EUR", "fr": "EUR", "it": "EUR", "es": "EUR",
+                 "ca": "CAD", "au": "AUD", "jp": "JPY", "com": "USD"}
+
+
+def infer_currency(url: Optional[str]) -> Optional[str]:
+    """Guess a price currency from a store URL's domain when the page didn't state one."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if not host:
+        return None
+    tld = host.rsplit(".", 1)[-1]
+    if tld == "com" and any(s in host for s in ("smartprix", "91mobiles", "gadgets360", "mysmartprice")):
+        return "INR"
+    return _TLD_CURRENCY.get(tld)
+
 
 PRICE_RE = re.compile(r"(?:₹|Rs\.?|INR|\$|USD)\s?(\d{1,3}(?:,\d{2,3})+|\d{3,7})(?:\.\d{1,2})?", re.I)
 
@@ -291,7 +307,7 @@ def compare_products(products: list[dict], budget: Optional[float] = None, prior
         ranked.append({
             "name": name,
             "price": price,
-            "currency": p.get("currency"),
+            "currency": p.get("currency") or infer_currency(p.get("url")),
             "url": p.get("url"),
             "fit_score": fit,
             "price_score": round(price_score, 3),

@@ -51,7 +51,7 @@ LLM ──► parse_requirements   product type, budget, currency, use case, mus
 ```
 
 The LLM decides which tool to call next. It can re-search, open more pages, or skip pages that
-block bots and use the search snippets instead. The loop stops at 12 rounds; if the agent runs
+block bots and use the search snippets instead. The loop stops at 8 rounds; if the agent runs
 out of rounds, it is forced to submit its recommendations.
 
 **Comparison scoring** (`app/tools.py::compare_products`):

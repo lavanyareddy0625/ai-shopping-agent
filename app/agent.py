@@ -15,7 +15,7 @@ import openai
 from . import tools
 from .llm import get_client
 
-MAX_ROUNDS = 12
+MAX_ROUNDS = 8
 MAX_TOOL_CHARS = 3500  # keep tool output small: free-tier LLMs have tight token limits
 MAX_RATE_LIMIT_WAITS = 8
 
@@ -27,7 +27,8 @@ response (they run in parallel) and aim to finish in 4 responses:
    specs, search queries) AND web_search for 2-3 queries. Infer sensible specs for the use case
    (e.g. AI/ML development laptop -> NVIDIA RTX GPU with more VRAM, 16GB+ RAM, 512GB+ SSD).
    Include the year, "price" and the country/currency in queries (a budget like "70,000" with no
-   currency means Indian Rupees).
+   currency means Indian Rupees). Always set "currency" (ISO code) on every product and
+   recommendation, matching the page the price came from (amazon.com -> USD, amazon.in -> INR).
 2. In ONE response: call extract_product on the 3-5 most promising URLs (retailer product pages
    or recent "best X under Y" listing pages). If a page is blocked, rely on its search snippet.
    Only search again if the results so far are clearly insufficient.
@@ -39,7 +40,9 @@ Rules:
 - Only use facts found in tool results. Never invent prices, specs or URLs; every source_url must
   be a URL that appeared in a tool result.
 - Respect the budget. Mention that prices are approximate as of the source and can change.
-- Be efficient: finish within about 8 tool rounds.
+- Be efficient: every LLM round costs 15-40 seconds. Do at most ONE extra search round, and as soon
+  as you have 3 priced products call compare_products then submit_recommendations. Good enough
+  beats perfect; never search once per brand or per retailer.
 """
 
 TOOL_SCHEMAS = [
@@ -214,9 +217,10 @@ def _completion(client, models: list[str], messages: list, tool_choice: Any = "a
     while True:
         model = models[0]
         try:
+            extra = {"reasoning_effort": "low"} if model.startswith("gemini") else {}
             return client.chat.completions.create(
                 model=model, messages=messages, tools=TOOL_SCHEMAS,
-                tool_choice=tool_choice, temperature=0.2,
+                tool_choice=tool_choice, temperature=0.2, **extra,
             )
         except (openai.RateLimitError, openai.NotFoundError, openai.InternalServerError) as e:
             if not isinstance(e, openai.RateLimitError) or _is_daily_quota(e):
@@ -310,6 +314,8 @@ def run_agent(query: str, client=None, model: Optional[str] = None) -> Iterator[
                     final = args
 
             if final is not None:
+                for rec in final.get("recommendations", []):
+                    rec["currency"] = rec.get("currency") or tools.infer_currency(rec.get("source_url"))
                 yield {"type": "final", "result": final, "comparison": comparison}
                 return
 
