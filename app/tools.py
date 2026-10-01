@@ -4,6 +4,7 @@ Each tool is a plain function returning a JSON-serialisable dict so the agent
 loop can hand results straight back to the LLM.
 """
 import json
+import math
 import os
 import re
 import threading
@@ -14,6 +15,8 @@ from typing import Any, Iterator, Optional
 import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+from . import db
 
 SEARCH_REGION = os.getenv("SEARCH_REGION", "in-en")
 _search_lock = threading.Lock()
@@ -35,51 +38,131 @@ SPEC_KEYWORDS = (
 
 _TLD_CURRENCY = {"in": "INR", "uk": "GBP", "de": "EUR", "fr": "EUR", "it": "EUR", "es": "EUR",
                  "ca": "CAD", "au": "AUD", "jp": "JPY", "com": "USD"}
+# Indian stores / price sites that use a plain .com domain.
+_INR_COM_HOSTS = ("flipkart.com", "myntra.com", "ajio.com", "croma.com", "tatacliq.com", "nykaa.com",
+                  "smartprix.com", "91mobiles.com", "gadgets360.com", "mysmartprice.com", "findprix.com")
+
+# Stores to favour for each DuckDuckGo region, so a generic query returns shops that sell locally.
+REGION_PROFILES = {
+    "in-en": {"country": "India", "currency": "INR", "tlds": ("in",),
+              "stores": ("amazon.in", "flipkart.com", "myntra.com", "ajio.com", "croma.com")},
+    "us-en": {"country": "the United States", "currency": "USD", "tlds": (),
+              "stores": ("amazon.com", "walmart.com", "target.com", "bestbuy.com")},
+    "uk-en": {"country": "the United Kingdom", "currency": "GBP", "tlds": ("uk",),
+              "stores": ("amazon.co.uk", "argos.co.uk", "currys.co.uk")},
+}
+SEARCH_TTL = int(os.getenv("SEARCH_CACHE_TTL", "21600"))    # 6 h: identical searches are reused
+EXTRACT_TTL = int(os.getenv("EXTRACT_CACHE_TTL", "21600"))
+
+
+def region_profile() -> Optional[dict]:
+    return REGION_PROFILES.get(SEARCH_REGION)
+
+
+def _host(url: Optional[str]) -> str:
+    return (urlparse(url or "").hostname or "").lower()
 
 
 def infer_currency(url: Optional[str]) -> Optional[str]:
     """Guess a price currency from a store URL's domain when the page didn't state one."""
-    host = (urlparse(url or "").hostname or "").lower()
+    host = _host(url)
     if not host:
         return None
-    tld = host.rsplit(".", 1)[-1]
-    if tld == "com" and any(s in host for s in ("smartprix", "91mobiles", "gadgets360", "mysmartprice")):
+    if any(host == h or host.endswith("." + h) for h in _INR_COM_HOSTS):
         return "INR"
-    return _TLD_CURRENCY.get(tld)
+    return _TLD_CURRENCY.get(host.rsplit(".", 1)[-1])
 
 
-PRICE_RE = re.compile(r"(?:₹|Rs\.?|INR|\$|USD)\s?(\d{1,3}(?:,\d{2,3})+|\d{3,7})(?:\.\d{1,2})?", re.I)
+def is_local_store(url: Optional[str]) -> bool:
+    """True when the URL belongs to a store that serves the configured search region."""
+    profile = region_profile()
+    host = _host(url)
+    if not profile or not host:
+        return False
+    return host.rsplit(".", 1)[-1] in profile["tlds"] or any(
+        host == s or host.endswith("." + s) for s in profile["stores"])
+
+
+_SYMBOL_CURRENCY = {"₹": "INR", "rs": "INR", "rs.": "INR", "inr": "INR", "$": "USD", "usd": "USD"}
+PRICE_RE = re.compile(
+    r"(₹|Rs\.?|INR|\$|USD)\s?(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)", re.I)
+
+
+# --------------------------------------------------------------------------- #
+# cache (SQLite) -- a cache failure must never break a search
+# --------------------------------------------------------------------------- #
+def _cache_get(key: str, ttl: int) -> Optional[dict]:
+    try:
+        return db.cache_get(key, ttl)
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, value: dict) -> None:
+    try:
+        db.cache_set(key, value)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
 # web_search
 # --------------------------------------------------------------------------- #
-def web_search(query: str, max_results: int = 8) -> dict:
-    """Search the public web (DuckDuckGo) and return titles, URLs and snippets."""
-    max_results = max(1, min(int(max_results or 8), 10))
-    hits, error = None, None
-    # DuckDuckGo throttles bursts, so searches run one at a time with a retry.
+def _ddg(query: str, max_results: int) -> tuple[Optional[list], Optional[Exception]]:
+    """One DuckDuckGo query. Searches run one at a time (it throttles bursts), with a retry."""
+    error = None
     with _search_lock:
         for attempt in range(2):
             try:
                 hits = DDGS().text(query, region=SEARCH_REGION, safesearch="moderate", max_results=max_results)
-                break
+                time.sleep(1)
+                return hits, None
             except Exception as e:  # network errors, throttling, "No results found"
                 error = e
                 time.sleep(2 + attempt * 2)
         time.sleep(1)
+    return None, error
+
+
+def _to_results(hits: list) -> list[dict]:
+    return [
+        {"title": h.get("title", ""), "url": h.get("href", ""), "snippet": (h.get("body") or "")[:300]}
+        for h in hits or [] if h.get("href")
+    ]
+
+
+def _search_uncached(query: str, max_results: int) -> dict:
+    hits, error = _ddg(query, max_results)
     if hits is None:
         return {"query": query, "results": [], "error": f"Search failed: {error}. Try a simpler query."}
-    results = [
-        {
-            "title": h.get("title", ""),
-            "url": h.get("href", ""),
-            "snippet": (h.get("body") or "")[:300],
-        }
-        for h in hits or []
-        if h.get("href")
-    ]
-    return {"query": query, "results": results}
+    results = _to_results(hits)
+
+    # Generic queries mostly return foreign shops. When too few results are from stores that serve
+    # the user's region, run one extra query restricted to the region's main stores.
+    profile = region_profile()
+    if profile and "site:" not in query.lower() and sum(is_local_store(r["url"]) for r in results) < 3:
+        sites = " OR ".join(f"site:{s}" for s in profile["stores"][:4])
+        extra, _ = _ddg(f"({sites}) {query}", max_results)
+        known = {r["url"] for r in results}
+        results += [r for r in _to_results(extra or []) if r["url"] not in known]
+
+    for r in results:
+        r["local_store"] = is_local_store(r["url"])
+        r["currency_hint"] = infer_currency(r["url"])
+    results.sort(key=lambda r: not r["local_store"])  # stable: local stores first
+    return {"query": query, "region": SEARCH_REGION, "results": results[:max_results + 2]}
+
+
+def web_search(query: str, max_results: int = 8) -> dict:
+    """Search the public web (DuckDuckGo), favouring stores that serve the user's region."""
+    max_results = max(1, min(int(max_results or 8), 10))
+    key = f"search:{SEARCH_REGION}:{max_results}:{' '.join(query.lower().split())}"
+    if (hit := _cache_get(key, SEARCH_TTL)) is not None:
+        return {**hit, "cached": True}
+    out = _search_uncached(query, max_results)
+    if out.get("results"):
+        _cache_set(key, out)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -202,15 +285,35 @@ def parse_product_html(html: str, url: str) -> dict:
             break
 
     info["specs"] = spec_lines[:25]
+    # Size / colour lines help check that the requested variant exists.
+    info["variant_lines"] = [l for l in lines if re.search(r"\b(sizes?|colou?rs?)\b", l, re.I) and len(l) <= 120][:6]
     # Listing / review pages ("best laptops under X") put many models + prices in text.
     info["price_mentions"] = price_lines
+    guess_currency = None
     if info.get("price") is None and price_lines:
-        info["price_guess"] = _to_float(PRICE_RE.search(price_lines[0]).group(1))
+        # Prefer a price line that mentions the product itself over an unrelated "₹499 shipping" line.
+        tokens = [w for w in re.findall(r"[a-z0-9]+", str(info.get("name", "")).lower()) if len(w) > 3]
+        line = next((l for l in price_lines if any(w in l.lower() for w in tokens)), price_lines[0])
+        m = PRICE_RE.search(line)
+        info["price_guess"] = _to_float(m.group(2))
+        guess_currency = _SYMBOL_CURRENCY.get(m.group(1).lower())
+    if (info.get("price") is not None or info.get("price_guess") is not None) and not info.get("currency"):
+        info["currency"] = guess_currency or infer_currency(url)
     return {k: v for k, v in info.items() if v not in (None, "", [])}
 
 
 def extract_product(url: str) -> dict:
-    """Fetch a URL and extract product name, price, rating and key specs."""
+    """Fetch a URL and extract product name, price, rating and key specs (cached for a few hours)."""
+    key = f"extract:{url}"
+    if (hit := _cache_get(key, EXTRACT_TTL)) is not None:
+        return {**hit, "cached": True}
+    out = _extract_uncached(url)
+    if "error" not in out:
+        _cache_set(key, out)
+    return out
+
+
+def _extract_uncached(url: str) -> dict:
     try:
         resp = httpx.get(url, headers=HEADERS, follow_redirects=True, timeout=15)
     except httpx.HTTPError as e:
@@ -261,15 +364,47 @@ def _hardware_bonus(specs: dict) -> float:
     return round(min(score, 1.0), 3)
 
 
-def compare_products(products: list[dict], budget: Optional[float] = None, priorities: Optional[list[str]] = None) -> dict:
-    """Deduplicate, budget-filter and rank candidate products.
+_PACK_RE = re.compile(
+    r"\b(\d{1,3})\s*[- ]?(?:pack|pk|pcs|pieces|count|ct)\b|\b(?:pack|set|lot|bundle)\s+of\s+(\d{1,3})\b", re.I)
+
+
+def parse_pack_size(text: str) -> int:
+    """Items per listing: '(6-Pack, Black, XL)' -> 6, 'Pack of 3' -> 3, anything else -> 1."""
+    m = _PACK_RE.search(text or "")
+    n = int(next(g for g in m.groups() if g)) if m else 1
+    return n if 1 <= n <= 100 else 1
+
+
+def _variant_status(requested: Optional[str], text: str, flag: Any) -> Optional[str]:
+    """confirmed | unconfirmed | unavailable for a requested size / colour (None if not requested)."""
+    if not requested or not str(requested).strip():
+        return None
+    if flag is False:
+        return "unavailable"
+    if flag is True:
+        return "confirmed"
+    pattern = r"(?<![a-z0-9])" + re.escape(str(requested).strip().lower()) + r"(?![a-z0-9])"
+    return "confirmed" if re.search(pattern, text.lower()) else "unconfirmed"
+
+
+def compare_products(products: list[dict], budget: Optional[float] = None, priorities: Optional[list[str]] = None,
+                     size: Optional[str] = None, color: Optional[str] = None, quantity: Optional[int] = 1) -> dict:
+    """Deduplicate, filter and rank candidate products.
 
     score = 0.60 * requirement fit (LLM-judged, 0-10)
-          + 0.25 * price efficiency (cheaper relative to budget is better)
+          + 0.25 * price efficiency (total cost vs budget, or unit price vs the other candidates)
           + 0.15 * hardware bonus (parsed RAM / GPU / VRAM / SSD)
+          - 0.10 buying a bigger pack than needed, - 0.05 per unconfirmed size / colour
+
+    Prices are compared per item: a 6-pack at 22 is 3.67 each, not 22. Out-of-stock listings and
+    listings the page says lack the requested size / colour are excluded, never silently ranked.
     """
     budget = _to_float(budget)
-    ranked, over_budget, seen = [], [], set()
+    try:
+        qty = max(1, int(quantity or 1))
+    except (TypeError, ValueError):
+        qty = 1
+    ranked, over_budget, unavailable, seen = [], [], [], set()
 
     for p in products or []:
         name = _clean(str(p.get("name", "")))
@@ -281,50 +416,90 @@ def compare_products(products: list[dict], budget: Optional[float] = None, prior
         price = _to_float(p.get("price"))
         raw_specs = p.get("specs") or {}
         spec_text = " ".join(f"{k} {v}" for k, v in raw_specs.items()) if isinstance(raw_specs, dict) else str(raw_specs)
-        parsed = parse_specs(f"{name} {spec_text}")
+        text = f"{name} {spec_text}"
+        parsed = parse_specs(text)
 
         try:
             fit = max(0.0, min(float(p.get("fit_score", 5)), 10.0))
         except (TypeError, ValueError):
             fit = 5.0
 
-        notes = []
+        notes: list[str] = []
+        penalty = 0.0
+
+        # --- availability: out of stock / requested variant missing -> excluded with the reason
+        size_status = _variant_status(size, text, p.get("size_available"))
+        color_status = _variant_status(color, text, p.get("color_available"))
+        reason = ("out of stock" if p.get("in_stock") is False
+                  else f"size {size} unavailable" if size_status == "unavailable"
+                  else f"colour {color} unavailable" if color_status == "unavailable" else None)
+        if reason:
+            unavailable.append({"name": name, "price": price, "url": p.get("url"), "reason": reason})
+            continue
+        for label, status, wanted in (("size", size_status, size), ("colour", color_status, color)):
+            if status == "unconfirmed":
+                notes.append(f"{label} {wanted} not confirmed on the page")
+                penalty += 0.05
+
+        # --- pack size -> per-item price and what it costs to get `qty` items
+        try:
+            pack = int(p.get("pack_size") or 0) or parse_pack_size(name)
+        except (TypeError, ValueError):
+            pack = parse_pack_size(name)
+        pack = max(pack, 1)
+        unit_price = round(price / pack, 2) if price is not None else None
+        total_cost = round(math.ceil(qty / pack) * price, 2) if price is not None else None
+        if pack > 1:
+            notes.append(f"{pack}-pack" + (f" ({unit_price:g} each)" if unit_price is not None else ""))
+            if pack > qty:
+                notes.append(f"you only need {qty}, so you'd pay for {pack}")
+                penalty += 0.10
+
         if price is None:
-            price_score = 0.5
             notes.append("price unknown")
         elif budget:
-            if price > budget * 1.05:
-                over_budget.append({"name": name, "price": price, "url": p.get("url")})
+            if total_cost > budget * 1.05:
+                over_budget.append({"name": name, "price": total_cost, "url": p.get("url")})
                 continue
-            if price > budget:
+            if total_cost > budget:
                 notes.append("slightly over budget")
-            price_score = max(0.0, 1 - 0.5 * price / budget)
+
+        ranked.append({
+            "name": name, "price": price, "currency": p.get("currency") or infer_currency(p.get("url")),
+            "pack_size": pack, "unit_price": unit_price, "total_cost": total_cost,
+            "url": p.get("url"), "fit_score": fit, "hardware_bonus": _hardware_bonus(parsed),
+            "size_status": size_status, "color_status": color_status, "_penalty": penalty,
+            "parsed_specs": parsed, "specs": raw_specs, "notes": notes,
+        })
+
+    # --- price efficiency (needs all candidates when there is no budget)
+    max_unit = max((r["unit_price"] for r in ranked if r["unit_price"]), default=None)
+    for r in ranked:
+        if r["total_cost"] is None:
+            price_score = 0.5
+        elif budget:
+            price_score = max(0.0, 1 - 0.5 * r["total_cost"] / budget)
+        elif max_unit:
+            price_score = 1 - 0.5 * r["unit_price"] / max_unit
         else:
             price_score = 0.5
-
-        hw = _hardware_bonus(parsed)
-        score = round(0.60 * fit / 10 + 0.25 * price_score + 0.15 * hw, 4)
-        ranked.append({
-            "name": name,
-            "price": price,
-            "currency": p.get("currency") or infer_currency(p.get("url")),
-            "url": p.get("url"),
-            "fit_score": fit,
-            "price_score": round(price_score, 3),
-            "hardware_bonus": hw,
-            "score": score,
-            "parsed_specs": parsed,
-            "specs": raw_specs,
-            "notes": notes,
-        })
+        r["price_score"] = round(price_score, 3)
+        r["score"] = round(max(0.0, 0.60 * r["fit_score"] / 10 + 0.25 * price_score
+                               + 0.15 * r["hardware_bonus"] - r.pop("_penalty")), 4)
 
     ranked.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(ranked, 1):
         r["rank"] = i
     return {
         "budget": budget,
+        "quantity": qty,
+        "size": size,
+        "color": color,
         "priorities": priorities or [],
         "ranked": ranked,
         "over_budget_excluded": over_budget,
-        "method": "score = 0.60*fit + 0.25*price_efficiency + 0.15*hardware_bonus; >5% over budget excluded",
+        "unavailable_excluded": unavailable,
+        "method": ("score = 0.60*fit + 0.25*price_efficiency (per item) + 0.15*hardware_bonus, minus penalties "
+                   "for oversized packs and unconfirmed size/colour; >5% over budget, out-of-stock and "
+                   "missing-variant listings excluded"),
     }

@@ -33,13 +33,30 @@ Tests (offline; a scripted fake LLM drives the full agent → API → DB path):
 uv run pytest -q
 ```
 
+## What it handles
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Currency / region | Searches favour stores that serve `SEARCH_REGION` (India: Amazon.in, Flipkart, Myntra, Ajio, Croma). Every price carries a currency, inferred from the store's domain when the page doesn't state one. |
+| Size, colour, quantity | Parsed from the request. Listings that are out of stock or lack the requested size/colour are excluded (and listed); unconfirmed variants are ranked lower and flagged. |
+| Multi-packs | `6-Pack` / `pack of 3` are detected; items are compared per unit and the budget applies to what you actually pay. Buying a bigger pack than needed is penalised. |
+| Invented links | Any recommendation whose URL never appeared in a tool result is flagged "unverified" in the UI. |
+| LLM quota exhausted | Models out of daily quota are skipped for 6 h. If the model fails after candidates were ranked, the top candidates are returned as a *partial* result instead of an error. |
+| Vague / non-shopping requests | The agent asks one clarifying question instead of guessing. |
+| Prompt injection | Web pages and snippets are treated as untrusted data. |
+| Repeat searches | Search and page results are cached (6 h). An identical finished search is replayed instantly; "Search again" forces fresh prices. |
+| Several users | History is private per browser (cookie). Per-IP rate limit and a cap on concurrent agent runs protect the free-tier quota. |
+
 ## Agentic workflow
 
 ```
 user request
    │
    ▼
-LLM ──► parse_requirements   product type, budget, currency, use case, must-haves, search queries
+(code) web_search on the raw request, run immediately so the LLM doesn't spend a round on it
+   │
+   ▼
+LLM ──► parse_requirements   product type, budget, currency, size, colour, quantity, use case, must-haves
    │
    ├──► web_search (×N, parallel)     DuckDuckGo → titles, URLs, snippets
    │
@@ -50,7 +67,8 @@ LLM ──► parse_requirements   product type, budget, currency, use case, mus
    └──► submit_recommendations        top 3–5 with price, key details, reason, source URL
 ```
 
-The LLM decides which tool to call next. It can re-search, open more pages, or skip pages that
+A typical run takes 3 LLM rounds (about 1-2 minutes on free tiers; mostly LLM latency and rate limits, so a
+Groq key is much faster). The LLM decides which tool to call next. It can re-search, open more pages, or skip pages that
 block bots and use the search snippets instead. The loop stops at 8 rounds; if the agent runs
 out of rounds, it is forced to submit its recommendations.
 
@@ -58,11 +76,13 @@ out of rounds, it is forced to submit its recommendations.
 
 ```
 score = 0.60 × fit_score (LLM-judged 0–10 fit to requirements)
-      + 0.25 × price efficiency (1 − 0.5 × price/budget)
+      + 0.25 × price efficiency (1 − 0.5 × cost/budget, or unit price vs the other candidates)
       + 0.15 × hardware bonus (RAM, dedicated GPU, VRAM, SSD parsed from specs)
+      − 0.10 oversized pack − 0.05 per unconfirmed size/colour
 ```
 
-Products more than 5% over budget are excluded and listed separately.
+Products more than 5% over budget, out of stock, or missing the requested size/colour are excluded
+and listed separately.
 
 **Grounding:** the system prompt forbids inventing prices or URLs. Every `source_url` must come
 from a tool result, and the UI shows the raw result of every tool call so you can check them.
@@ -84,7 +104,7 @@ tests/test_app.py   offline tests
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/api/search` `{"query": "..."}` | Runs the agent. Streams events: `start`, `meta`, `requirements`, `thought`, `tool_call`, `tool_result`, `final`, `error` |
+| POST   | `/api/search` `{"query": "...", "refresh": false}` | Runs the agent (or replays a recent identical search). Streams events: `start`, `meta`, `requirements`, `thought`, `tool_call`, `tool_result`, `final`, `error`. Returns 422 for junk input, 429 when rate-limited, 503 when busy |
 | GET    | `/api/history` | Past searches |
 | GET    | `/api/history/{id}` | One search: requirements, recommendations, comparison, full agent trace |
 | DELETE | `/api/history/{id}` | Delete a search |
@@ -96,4 +116,6 @@ tests/test_app.py   offline tests
 - Prices come from public pages at search time and may be stale.
 - Groq's free tier has tight tokens-per-minute limits. The client retries on HTTP 429. If you hit
   daily limits, switch to `LLM_MODEL=llama-3.1-8b-instant` or use Gemini.
+- Size/colour/stock are only verified when a page states them; otherwise the result is marked "not confirmed".
+- Results come from DuckDuckGo plus scraping, so they are only as good as what public pages expose.
 - Search results default to India (`SEARCH_REGION=in-en`). Change it for other markets.

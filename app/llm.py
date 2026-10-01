@@ -1,5 +1,6 @@
 """LLM client: Groq or Gemini, both via their OpenAI-compatible endpoints."""
 import os
+import time
 
 from openai import OpenAI
 
@@ -20,6 +21,22 @@ PROVIDERS = {
         ],
     },
 }
+
+
+# Models whose daily quota ran out are skipped for a while, so later searches don't waste
+# 5-15 s per dead model rediscovering it.
+_EXHAUSTED: dict[str, float] = {}
+EXHAUSTED_SKIP_SECONDS = 6 * 3600
+
+
+def mark_exhausted(model: str) -> None:
+    _EXHAUSTED[model] = time.time()
+
+
+def live_models(models: list[str]) -> list[str]:
+    now = time.time()
+    live = [m for m in models if now - _EXHAUSTED.get(m, 0) > EXHAUSTED_SKIP_SECONDS]
+    return live or list(models)  # everything looked exhausted: try them all again
 
 
 def resolve_provider() -> str:
@@ -47,4 +64,4 @@ def get_client() -> tuple[OpenAI, list[str], str]:
     env_models = [m.strip() for m in os.getenv("LLM_MODEL", "").split(",") if m.strip()]
     models = env_models or list(cfg["default_models"])
     client = OpenAI(api_key=api_key, base_url=cfg["base_url"], max_retries=2, timeout=90)
-    return client, models, provider
+    return client, live_models(models), provider
